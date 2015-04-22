@@ -37,23 +37,8 @@ type NotificationResult struct {
 	Err   Error
 }
 
-type Alert struct {
-	// Do not add fields without updating the implementation of isZero.
-	Body         string   `json:"body,omitempty"`
-	Title        string   `json:"title,omitempty"`
-	Action       string   `json:"action,omitempty"`
-	LocKey       string   `json:"loc-key,omitempty"`
-	LocArgs      []string `json:"loc-args,omitempty"`
-	ActionLocKey string   `json:"action-loc-key,omitempty"`
-	LaunchImage  string   `json:"launch-image,omitempty"`
-}
-
-func (a *Alert) isZero() bool {
-	return len(a.Body) == 0 && len(a.LocKey) == 0 && len(a.LocArgs) == 0 && len(a.ActionLocKey) == 0 && len(a.LaunchImage) == 0
-}
-
 type APS struct {
-	Alert            Alert
+	Alert            string
 	Badge            *int // 0 to clear notifications, nil to leave as is.
 	Sound            string
 	ContentAvailable int
@@ -64,7 +49,7 @@ type APS struct {
 func (aps APS) MarshalJSON() ([]byte, error) {
 	data := make(map[string]interface{})
 
-	if !aps.Alert.isZero() {
+	if aps.Alert != "" {
 		data["alert"] = aps.Alert
 	}
 	if aps.Badge != nil {
