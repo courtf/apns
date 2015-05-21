@@ -120,10 +120,13 @@ func (n Notification) ToBinary() ([]byte, error) {
 
 	binTok, err := hex.DecodeString(n.DeviceToken)
 	if err != nil {
-		return b, fmt.Errorf("convert token to hex error: %s", err)
+		return nil, fmt.Errorf("convert token to hex error: %s", err)
 	}
 
-	j, _ := json.Marshal(n.Payload)
+	j, err := json.Marshal(n.Payload)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := bytes.NewBuffer(b)
 

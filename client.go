@@ -190,9 +190,9 @@ func (c *Client) readErrs() {
 	defer c.sent.Unlock()
 
 	apnsErr := NewError(p)
-	cursor := c.sent.Back()
+	var resend *list.Element
 
-	for cursor != nil {
+	for cursor := c.sent.Back(); cursor != nil; cursor = cursor.Prev() {
 		// Get notification
 		n, _ := cursor.Value.(Notification)
 
@@ -200,16 +200,14 @@ func (c *Client) readErrs() {
 		if n.Identifier == apnsErr.Identifier {
 			log.Println("APNS notification failed:", apnsErr.Error())
 			go c.reportFailedPush(n, apnsErr)
-			cursor = cursor.Next()
+			resend = cursor.Next()
 			c.sent.Remove(cursor)
 			break
 		}
-
-		cursor = cursor.Prev()
 	}
 
-	for ; cursor != nil; cursor = cursor.Next() {
-		if n, ok := cursor.Value.(Notification); ok {
+	for ; resend != nil; resend = resend.Next() {
+		if n, ok := resend.Value.(Notification); ok {
 			go c.Send(n)
 		}
 	}
