@@ -5,19 +5,26 @@ import (
 	"crypto/tls"
 	"io"
 	"log"
+	"sync"
 	"time"
 )
 
 type buffer struct {
 	size int
 	*list.List
+	sync.Mutex
 }
 
 func newBuffer(size int) *buffer {
-	return &buffer{size, list.New()}
+	return &buffer{
+		size: size,
+		List: list.New(),
+	}
 }
 
 func (b *buffer) Add(v interface{}) *list.Element {
+	b.Lock()
+	defer b.Unlock()
 	e := b.PushBack(v)
 
 	if b.Len() > b.size {
@@ -31,189 +38,184 @@ type Client struct {
 	Conn         *Conn
 	FailedNotifs chan NotificationResult
 
-	notifs chan Notification
-	id     uint32
+	sent *buffer
+	id   uint32
+
+	// concurrency
+	idm          sync.Mutex
+	reconnecting bool
+	cond         *sync.Cond
 }
 
-func newClientWithConn(gw string, conn Conn) Client {
-	c := Client{
+func newClientWithConn(gw string, conn Conn) *Client {
+	c := &Client{
 		Conn:         &conn,
 		FailedNotifs: make(chan NotificationResult),
+		sent:         newBuffer(1000),
 		id:           uint32(1),
-		notifs:       make(chan Notification),
+		cond:         sync.NewCond(&sync.Mutex{}),
 	}
 
-	go c.runLoop()
+	c.reconnect()
 
 	return c
 }
 
-func NewClientWithCert(gw string, cert tls.Certificate) Client {
+func NewClientWithCert(gw string, cert tls.Certificate) *Client {
 	conn := NewConnWithCert(gw, cert)
 
 	return newClientWithConn(gw, conn)
 }
 
-func NewClient(gw string, cert string, key string) (Client, error) {
+func NewClient(gw string, cert string, key string) (*Client, error) {
 	conn, err := NewConn(gw, cert, key)
 	if err != nil {
-		return Client{}, err
+		return nil, err
 	}
 
 	return newClientWithConn(gw, conn), nil
 }
 
-func NewClientWithFiles(gw string, certFile string, keyFile string) (Client, error) {
+func NewClientWithFiles(gw string, certFile string, keyFile string) (*Client, error) {
 	conn, err := NewConnWithFiles(gw, certFile, keyFile)
 	if err != nil {
-		return Client{}, err
+		return nil, err
 	}
 
 	return newClientWithConn(gw, conn), nil
 }
 
-func (c *Client) Send(n Notification) error {
-	c.notifs <- n
-	return nil
-}
+func (c *Client) Send(n Notification) (err error) {
+	defer func() {
+		if err != nil {
+			// Requeue in case of transport error; actual APNS
+			// error-responses are handled by readErrs
+			go c.Send(n)
+		}
+	}()
 
-func (c *Client) reportFailedPush(v interface{}, err *Error) {
-	failedNotif, ok := v.(Notification)
-	if !ok || v == nil {
+	// Set identifier if not specified
+	c.idm.Lock()
+	if n.Identifier == 0 {
+		n.Identifier = c.id
+		c.id++
+	} else if c.id < n.Identifier {
+		c.id = n.Identifier + 1
+	}
+	c.idm.Unlock()
+
+	var b []byte
+	b, err = n.ToBinary()
+	if err != nil {
+		log.Println("Could not convert APNS notification to binary:", err)
+		return nil
+	}
+
+	// Check for reconnection in progress just before send
+	c.cond.L.Lock()
+	for c.reconnecting {
+		c.cond.Wait()
+	}
+	c.cond.L.Unlock()
+
+	_, err = c.Conn.Write(b)
+
+	if err == io.EOF {
+		log.Println("EOF trying to write notification")
 		return
 	}
 
-	select {
-	case c.FailedNotifs <- NotificationResult{Notif: failedNotif, Err: *err}:
-	default:
+	if err != nil {
+		log.Println("err writing to apns", err.Error())
+		return
 	}
+
+	// Add to sent list after successful send
+	c.sent.Add(n)
+
+	return
 }
 
-func (c *Client) requeue(cursor *list.Element) {
-	// If `cursor` is not nil, this means there are notifications that
-	// need to be delivered (or redelivered)
-	for ; cursor != nil; cursor = cursor.Next() {
-		if n, ok := cursor.Value.(Notification); ok {
-			go func() { c.notifs <- n }()
+func (c *Client) reconnect() {
+	var cont bool
+	c.cond.L.Lock()
+	if !c.reconnecting {
+		c.reconnecting = true
+		cont = true
+	}
+	c.cond.L.Unlock()
+
+	if !cont {
+		return
+	}
+
+	for {
+		if err := c.Conn.Connect(); err != nil {
+			// TODO Probably want to exponentially backoff...
+			log.Println("Error connecting to APNS, will retry:", err)
+			time.Sleep(time.Second)
+			continue
 		}
+		break
 	}
+
+	go c.readErrs()
+
+	c.cond.L.Lock()
+	c.reconnecting = false
+	c.cond.L.Unlock()
+	c.cond.Broadcast()
 }
 
-func (c *Client) handleError(err *Error, buffer *buffer) *list.Element {
-	cursor := buffer.Back()
+func (c *Client) readErrs() {
+	p := make([]byte, 6, 6)
+	_, err := c.Conn.Read(p)
 
-	for cursor != nil {
+	// Error encountered, reconnect
+	go c.reconnect()
+
+	// If the error was just some transport error, log and move on
+	if err != nil {
+		// If EOF immediately after connecting, make sure you are hitting
+		// the correct gateway for your cert
+		log.Println("APNS connection error:", err)
+		return
+	}
+
+	// We got an APNS error-response packet
+
+	// Lock the sent list so we can iterate over it and remove
+	// the offending notification without interference
+	c.sent.Lock()
+	defer c.sent.Unlock()
+
+	apnsErr := NewError(p)
+	var resend *list.Element
+
+	for cursor := c.sent.Back(); cursor != nil; cursor = cursor.Prev() {
 		// Get notification
 		n, _ := cursor.Value.(Notification)
 
-		// If the notification, move cursor after the trouble notification
-		if n.Identifier == err.Identifier {
-			go c.reportFailedPush(cursor.Value, err)
-
-			next := cursor.Next()
-
-			buffer.Remove(cursor)
-			return next
+		// If the notification id matches, move cursor after the trouble notification
+		if n.Identifier == apnsErr.Identifier {
+			log.Println("APNS notification failed:", apnsErr.Error())
+			go c.reportFailedPush(n, apnsErr)
+			resend = cursor.Next()
+			c.sent.Remove(cursor)
+			break
 		}
-
-		cursor = cursor.Prev()
 	}
 
-	return cursor
-}
-
-func (c *Client) runLoop() {
-	sent := newBuffer(50)
-	cursor := sent.Front()
-
-	// APNS connection
-	for {
-		err := c.Conn.Connect()
-		if err != nil {
-			// TODO Probably want to exponentially backoff...
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		// Start reading errors from APNS
-		errs := readErrs(c.Conn)
-
-		c.requeue(cursor)
-
-		// Connection open, listen for notifs and errors
-		for {
-			var err error
-			var n Notification
-
-			// Check for notifications or errors. There is a chance we'll send notifications
-			// if we already have an error since `select` will "pseudorandomly" choose a
-			// ready channels. It turns out to be fine because the connection will already
-			// be closed and it'll requeue. We could check before we get to this select
-			// block, but it doesn't seem worth the extra code and complexity.
-			select {
-			case err = <-errs:
-			case n = <-c.notifs:
-			}
-
-			// If there is an error we understand, find the notification that failed,
-			// move the cursor right after it.
-			if nErr, ok := err.(*Error); ok {
-				cursor = c.handleError(nErr, sent)
-				break
-			}
-
-			if err != nil {
-				break
-			}
-
-			// Add to list
-			cursor = sent.Add(n)
-
-			// Set identifier if not specified
-			if n.Identifier == 0 {
-				n.Identifier = c.id
-				c.id++
-			} else if c.id < n.Identifier {
-				c.id = n.Identifier + 1
-			}
-
-			b, err := n.ToBinary()
-			if err != nil {
-				// TODO
-				continue
-			}
-
-			_, err = c.Conn.Write(b)
-
-			if err == io.EOF {
-				log.Println("EOF trying to write notification")
-				break
-			}
-
-			if err != nil {
-				log.Println("err writing to apns", err.Error())
-				break
-			}
-
-			cursor = cursor.Next()
+	for ; resend != nil; resend = resend.Next() {
+		if n, ok := resend.Value.(Notification); ok {
+			go c.Send(n)
 		}
 	}
 }
 
-func readErrs(c *Conn) chan error {
-	errs := make(chan error)
-
-	go func() {
-		p := make([]byte, 6, 6)
-		_, err := c.Read(p)
-		if err != nil {
-			errs <- err
-			return
-		}
-
-		e := NewError(p)
-		errs <- &e
-	}()
-
-	return errs
+func (c *Client) reportFailedPush(n Notification, err Error) {
+	select {
+	case c.FailedNotifs <- NotificationResult{n, err}:
+	default:
+	}
 }

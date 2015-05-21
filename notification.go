@@ -48,8 +48,13 @@ type Alert struct {
 	LaunchImage  string   `json:"launch-image,omitempty"`
 }
 
+// isSimple alerts only contain a Body.
+func (a *Alert) isSimple() bool {
+	return len(a.Title) == 0 && len(a.Action) == 0 && len(a.LocKey) == 0 && len(a.LocArgs) == 0 && len(a.ActionLocKey) == 0 && len(a.LaunchImage) == 0
+}
+
 func (a *Alert) isZero() bool {
-	return len(a.Body) == 0 && len(a.LocKey) == 0 && len(a.LocArgs) == 0 && len(a.ActionLocKey) == 0 && len(a.LaunchImage) == 0
+	return a.isSimple() && len(a.Body) == 0
 }
 
 type APS struct {
@@ -65,7 +70,11 @@ func (aps APS) MarshalJSON() ([]byte, error) {
 	data := make(map[string]interface{})
 
 	if !aps.Alert.isZero() {
-		data["alert"] = aps.Alert
+		if aps.Alert.isSimple() {
+			data["alert"] = aps.Alert.Body
+		} else {
+			data["alert"] = aps.Alert
+		}
 	}
 	if aps.Badge != nil {
 		data["badge"] = aps.Badge
@@ -135,10 +144,13 @@ func (n Notification) ToBinary() ([]byte, error) {
 
 	binTok, err := hex.DecodeString(n.DeviceToken)
 	if err != nil {
-		return b, fmt.Errorf("convert token to hex error: %s", err)
+		return nil, fmt.Errorf("convert token to hex error: %s", err)
 	}
 
-	j, _ := json.Marshal(n.Payload)
+	j, err := json.Marshal(n.Payload)
+	if err != nil {
+		return nil, err
+	}
 
 	buf := bytes.NewBuffer(b)
 
