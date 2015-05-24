@@ -90,6 +90,7 @@ func (c *Client) Send(n Notification) (err error) {
 		if err != nil {
 			// Requeue in case of transport error; actual APNS
 			// error-responses are handled by readErrs
+			go c.reconnect()
 			go c.Send(n)
 		}
 	}()
