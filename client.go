@@ -3,7 +3,6 @@ package apns
 import (
 	"container/list"
 	"crypto/tls"
-	"io"
 	"log"
 	"sync"
 	"time"
@@ -85,16 +84,7 @@ func NewClientWithFiles(gw string, certFile string, keyFile string) (*Client, er
 	return newClientWithConn(gw, conn), nil
 }
 
-func (c *Client) Send(n Notification) (err error) {
-	defer func() {
-		if err != nil {
-			// Requeue in case of transport error; actual APNS
-			// error-responses are handled by readErrs
-			go c.reconnect()
-			go c.Send(n)
-		}
-	}()
-
+func (c *Client) Send(n Notification) {
 	// Set identifier if not specified
 	c.idm.Lock()
 	if n.Identifier == 0 {
@@ -105,11 +95,10 @@ func (c *Client) Send(n Notification) (err error) {
 	}
 	c.idm.Unlock()
 
-	var b []byte
-	b, err = n.ToBinary()
+	b, err := n.ToBinary()
 	if err != nil {
 		log.Println("Could not convert APNS notification to binary:", err)
-		return nil
+		return
 	}
 
 	// Check for reconnection in progress just before send
@@ -119,15 +108,12 @@ func (c *Client) Send(n Notification) (err error) {
 	}
 	c.cond.L.Unlock()
 
-	_, err = c.Conn.Write(b)
+	if _, err := c.Conn.Write(b); err != nil {
+		// reconnect the socket
+		c.reconnect()
 
-	if err == io.EOF {
-		log.Println("EOF trying to write notification")
-		return
-	}
-
-	if err != nil {
-		log.Println("err writing to apns", err.Error())
+		// send this notification again
+		c.Send(n)
 		return
 	}
 
