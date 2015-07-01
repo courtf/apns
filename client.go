@@ -109,6 +109,7 @@ func (c *Client) Send(n Notification) {
 	c.cond.L.Unlock()
 
 	if _, err := c.Conn.Write(b); err != nil {
+		log.Println("Error writing to APNS connection:", err)
 		// reconnect the socket
 		c.reconnect()
 
@@ -145,6 +146,8 @@ func (c *Client) reconnect() {
 		}
 		break
 	}
+
+	log.Println("Connection to APNS (re-)established.")
 
 	go c.readErrs()
 
