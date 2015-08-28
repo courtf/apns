@@ -37,8 +37,9 @@ type Client struct {
 	Conn         *Conn
 	FailedNotifs chan NotificationResult
 
-	sent *buffer
-	id   uint32
+	sent    *buffer
+	id      uint32
+	verbose bool
 
 	// concurrency
 	idm          sync.Mutex
@@ -46,12 +47,13 @@ type Client struct {
 	cond         *sync.Cond
 }
 
-func newClientWithConn(gw string, conn Conn) *Client {
+func newClientWithConn(gw string, conn Conn, verbose bool) *Client {
 	c := &Client{
 		Conn:         &conn,
 		FailedNotifs: make(chan NotificationResult),
 		sent:         newBuffer(1000),
 		id:           uint32(1),
+		verbose:      verbose,
 		cond:         sync.NewCond(&sync.Mutex{}),
 	}
 
@@ -60,28 +62,34 @@ func newClientWithConn(gw string, conn Conn) *Client {
 	return c
 }
 
-func NewClientWithCert(gw string, cert tls.Certificate) *Client {
+func NewClientWithCert(gw string, cert tls.Certificate, verbose bool) *Client {
 	conn := NewConnWithCert(gw, cert)
 
-	return newClientWithConn(gw, conn)
+	return newClientWithConn(gw, conn, verbose)
 }
 
-func NewClient(gw string, cert string, key string) (*Client, error) {
+func NewClient(gw string, cert string, key string, verbose bool) (*Client, error) {
 	conn, err := NewConn(gw, cert, key)
 	if err != nil {
 		return nil, err
 	}
 
-	return newClientWithConn(gw, conn), nil
+	return newClientWithConn(gw, conn, verbose), nil
 }
 
-func NewClientWithFiles(gw string, certFile string, keyFile string) (*Client, error) {
+func NewClientWithFiles(gw string, certFile string, keyFile string, verbose bool) (*Client, error) {
 	conn, err := NewConnWithFiles(gw, certFile, keyFile)
 	if err != nil {
 		return nil, err
 	}
 
-	return newClientWithConn(gw, conn), nil
+	return newClientWithConn(gw, conn, verbose), nil
+}
+
+func (c *Client) log(v ...interface{}) {
+	if c.verbose {
+		log.Println(v...)
+	}
 }
 
 func (c *Client) Send(n Notification) {
@@ -109,7 +117,7 @@ func (c *Client) Send(n Notification) {
 	c.cond.L.Unlock()
 
 	if _, err := c.Conn.Write(b); err != nil {
-		log.Println("Error writing to APNS connection:", err)
+		c.log("Error writing to APNS connection:", err)
 		// reconnect the socket
 		c.reconnect()
 
@@ -168,7 +176,7 @@ func (c *Client) readErrs() {
 	if err != nil {
 		// If EOF immediately after connecting, make sure you are hitting
 		// the correct gateway for your cert
-		log.Println("APNS connection error:", err)
+		c.log("APNS connection error:", err)
 		return
 	}
 
@@ -188,7 +196,7 @@ func (c *Client) readErrs() {
 
 		// If the notification id matches, move cursor after the trouble notification
 		if n.Identifier == apnsErr.Identifier {
-			log.Println("APNS notification failed:", apnsErr.Error())
+			log.Println("APNS notification failed:", apnsErr.Error(), n.ID)
 			go c.reportFailedPush(n, apnsErr)
 			resend = cursor.Next()
 			c.sent.Remove(cursor)
