@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+const (
+	historySize = 1000
+)
+
 type buffer struct {
 	size int
 	*list.List
@@ -51,7 +55,7 @@ func newClientWithConn(gw string, conn Conn, verbose bool) *Client {
 	c := &Client{
 		Conn:         &conn,
 		FailedNotifs: make(chan NotificationResult),
-		sent:         newBuffer(1000),
+		sent:         newBuffer(historySize),
 		id:           uint32(1),
 		verbose:      verbose,
 		cond:         sync.NewCond(&sync.Mutex{}),
@@ -204,9 +208,14 @@ func (c *Client) readErrs() {
 		}
 	}
 
+	sem := make(chan struct{}, historySize)
 	for ; resend != nil; resend = resend.Next() {
 		if n, ok := resend.Value.(Notification); ok {
-			go c.Send(n)
+			sem <- struct{}{}
+			go func() {
+				c.Send(n)
+				<-sem
+			}()
 		}
 	}
 }
