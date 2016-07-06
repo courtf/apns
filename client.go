@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"crypto/tls"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -49,6 +50,7 @@ type Client struct {
 	idm          sync.Mutex
 	reconnecting bool
 	cond         *sync.Cond
+	quit         chan struct{}
 }
 
 func newClientWithConn(gw string, conn Conn, verbose bool) *Client {
@@ -59,6 +61,7 @@ func newClientWithConn(gw string, conn Conn, verbose bool) *Client {
 		id:           uint32(1),
 		verbose:      verbose,
 		cond:         sync.NewCond(&sync.Mutex{}),
+		quit:         make(chan struct{}),
 	}
 
 	c.reconnect()
@@ -136,6 +139,10 @@ func (c *Client) Send(n Notification) {
 	return
 }
 
+func (c *Client) Close() {
+	close(c.quit)
+}
+
 func (c *Client) reconnect() {
 	var cont bool
 	c.cond.L.Lock()
@@ -174,18 +181,28 @@ func (c *Client) readErrs() {
 	c.Conn.NetConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	_, err := c.Conn.Read(p)
 
-	// Error encountered, reconnect
-	go c.reconnect()
-
 	// If the error was just some transport error, log and move on
 	if err != nil {
 		// If EOF immediately after connecting, make sure you are hitting
 		// the correct gateway for your cert
 		c.log("APNS connection error:", err)
+
+		// If it's a timeout, and we've been asked to close, return
+		// and don't reconnect
+		if strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			select {
+			case <-c.quit:
+				return
+			default:
+			}
+		}
+
+		go c.reconnect()
 		return
 	}
 
 	// We got an APNS error-response packet
+	go c.reconnect()
 
 	// Lock the sent list so we can iterate over it and remove
 	// the offending notification without interference
