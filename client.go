@@ -171,14 +171,7 @@ func (c *Client) reconnect() {
 
 func (c *Client) readErrs() {
 	p := make([]byte, 6, 6)
-	// TODO: consider setting read deadline here
-	// I have witnessed this connection timing out after X time, seemingly because
-	// Apple has not had issues to report back in a while. For some minutes before
-	// the timeout, sends appear to succeed, but nothing is delivered. Then the
-	// connection read times out, is re-negotiated and pushes start to arrive again.
-	// Very odd, but since re-negotiating is cheap, we could just do that every Y
-	// amount of time in an attempt to keep the connection functional and not
-	// silently closing.
+	c.Conn.NetConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	_, err := c.Conn.Read(p)
 
 	// Error encountered, reconnect
